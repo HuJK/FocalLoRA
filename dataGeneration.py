@@ -1,6 +1,5 @@
 import json, os
 
-# Path where original files were stored
 base_path = "data"
 
 type_configs = {
