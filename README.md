@@ -1,5 +1,8 @@
 ## Don’t Forget the Enjoin: FocalLoRA for Instruction Hierarchical Alignment in Large Language Models
 
+### framework
+![framework](figure/framework.png)
+
 ### Data Generation
 ```
 python dataGeneration.py
