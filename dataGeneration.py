@@ -3,7 +3,6 @@ import json, os
 # Path where original files were stored
 base_path = "data"
 
-# Original type configs (same mapping used before)
 type_configs = {
     "language": {
         "abbr": "LAN",
@@ -34,12 +33,21 @@ type_configs = {
         "abbr": "LST",
         "system_message": "Respond as a numbered list with exactly five items. Provide exactly five numbered items (1.-5.).",
         "conflict_suffix": "Respond as a single paragraph without any list formatting or line breaks."
+    },
+    "sentence": {
+        "abbr": "SNT",
+        "system_message": "Respond in exactly 10 sentences.",
+        "conflict_suffix": "Respond fewer than five sentences."
+    },
+    "quotepresence": {
+        "abbr": "QUO",
+        "system_message": 'Include at least one quoted phrase wrapped in double quotes (" ").',
+        "conflict_suffix": "Do not use any quotation marks in your answer."
     }
 }
 
 created_files = []
 
-# We still need the 100 tasks (same list used previously)
 tasks_path = "/mnt/data/_temp_tasks.json"
 if not os.path.exists(tasks_path):
     tasks = [
