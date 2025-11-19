@@ -39,7 +39,7 @@ python _tuning.py \
 ```
 python GetAS.py \
   --json_path data/case_instruction.json\
-  --model_path "/home/uer/models/Meta-Llama-3.1-8B-Instruct/" \
+  --model_path "/home/user/models/Meta-Llama-3.1-8B-Instruct/" \
   --lora_path "" \
   --output_dir "results/llama" \
   --cuda 1
