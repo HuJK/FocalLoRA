@@ -22,6 +22,14 @@ python visualization_attention.py \
   --output_path "./attention_visualization/lora_llama_case" 
 ```
 
+To reproduce the conflict-vs-normal case study described in the paper, run the helper script:
+
+```
+./visualize.sh
+```
+
+This script constructs the greenhouse-effect prompts (English-only system, optional French-only user instruction), and renders attention maps for both the base model and the fine-tuned LoRA adapter under `attention_visualization/base_model` and `attention_visualization/finetuned`.
+
 ### Model fine-tuning
 ```
 python _tuning.py \

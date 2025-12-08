@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Project artifacts
+code/*.ipynb
+code/eval_dataset
+data/*
+Paper.pdf
+Paper.txt
+visualization
+LoraAdapter/*
+models/*
+temp/*

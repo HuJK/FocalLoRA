@@ -244,17 +244,89 @@ def focus_loss(attns, sys_mask, heads):
     return total_loss / max(valid_heads, 1)
 
 # ======================================================
+# Dataset and Collate Function for Fine-tuning
+# ======================================================
+
+class ConflictDS(Dataset):
+    """Dataset for loading conflict samples from multiple JSON files."""
+
+    def __init__(self, json_files: List[str], tokenizer):
+        self.samples = []
+        self.tokenizer = tokenizer
+
+        for json_file in json_files:
+            if not os.path.exists(json_file):
+                continue
+            with open(json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Filter for conflict samples only
+                conflicts = [s for s in data if s.get('label') == 'conflict']
+                self.samples.extend(conflicts)
+
+        print(f"📊 Loaded {len(self.samples)} conflict samples from {len(json_files)} files")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+def collate(batch: List[Dict], tokenizer):
+    """
+    Collate function to batch samples and tokenize them.
+    Combines task + user_message as described in the paper.
+    """
+    conversations = []
+
+    for sample in batch:
+        # Combine task and user_message (if present)
+        task = sample.get('task', '')
+        user_msg = sample.get('user_message', '')
+
+        # Combine as per line 209 logic: task + user_message
+        user_content = f"{task} {user_msg}".strip() if user_msg else task
+
+        # Build chat format
+        messages = [
+            {"role": "system", "content": sample['system_message']},
+            {"role": "user", "content": user_content}
+        ]
+        conversations.append(messages)
+
+    # Apply chat template and tokenize
+    texts = [
+        tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
+        for conv in conversations
+    ]
+
+    # Tokenize with padding
+    encoded = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=2048,
+        return_tensors='pt'
+    )
+
+    return {
+        'input_ids': encoded['input_ids'],
+        'attention_mask': encoded['attention_mask']
+    }
+
+# ======================================================
 # 6️⃣  Training with LoRA on selected heads
 # ======================================================
 
 def tune(model, tok, heads, data_dir, out_dir, epochs, bs, lr, lam_foc):
     layers = sorted({int(t.split("_")[0][1:]) for t, _ in heads})
+
+    targets = get_lora_targets(model, layers)
     if not targets:
         raise ValueError("No q/k projection layers found!")
 
     lora_cfg = LoraConfig(r=8, lora_alpha=16, bias="none",
                           target_modules=targets, task_type="CAUSAL_LM")
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
     model = get_peft_model(model, lora_cfg)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -286,9 +358,9 @@ def tune(model, tok, heads, data_dir, out_dir, epochs, bs, lr, lam_foc):
             opt.zero_grad()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-    model.save_pretrained(out_dir)
-    tok.save_pretrained(out_dir)
-    print(f"✅ LoRA adapter saved → {out_dir}")
+        model.save_pretrained(out_dir + "batch_" + str(ep))
+        tok.save_pretrained(out_dir + "batch_" + str(ep))
+        print(f"✅ LoRA adapter saved → {out_dir}")
 
 
 def main():

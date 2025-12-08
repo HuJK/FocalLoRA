@@ -1,6 +1,6 @@
 # coding: utf-8
 
-import os, json, argparse
+import os, json, argparse, importlib.util, re
 from pathlib import Path
 from functools import lru_cache
 import torch
@@ -115,14 +115,35 @@ def build_token_ranges(tokenizer, full_ids, sys_ids, usr_ids):
     return sys_range, usr_range
 
 def load_important_heads(path):
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    pairs = []
-    for tag, _ in data["important_heads"]:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".py":
+        spec = importlib.util.spec_from_file_location("viz_heads_cfg", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        raw_heads = getattr(module, "HEADS", None)
+        if raw_heads is None:
+            raise ValueError(f"HEADS not defined in {path}")
+        head_list = raw_heads
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        head_list = data.get("important_heads")
+        if head_list is None:
+            raise ValueError(f"important_heads missing in {path}")
+
+    pairs, tags = [], []
+    for entry in head_list:
+        if isinstance(entry, (list, tuple)) and len(entry) == 2:
+            tag, _ = entry
+        elif isinstance(entry, dict) and "tag" in entry:
+            tag = entry["tag"]
+        else:
+            raise ValueError(f"Invalid head entry: {entry}")
         l = int(tag.split("_")[0][1:])
         h = int(tag.split("_")[1][1:])
         pairs.append((l, h))
-    return pairs, [tag for tag, _ in data["important_heads"]]
+        tags.append(tag)
+    return pairs, tags
 
 def last_token_selected_heads(attentions, selected_pairs):
     S = attentions[0].shape[-1]
@@ -154,7 +175,7 @@ def plot_heatmap(mat, tokens, row_labels, out_path, title):
         mat.T,
         cmap=custom_cmap,
         vmin=0.0,
-        vmax=0.2,
+        vmax=1,
         xticklabels=row_labels,
         yticklabels=[clean_token(t) for t in tokens],
         cbar_kws={"label": "Attention Score", "format": '%.2f'}
@@ -172,6 +193,65 @@ def plot_heatmap(mat, tokens, row_labels, out_path, title):
     plt.savefig(out_path, dpi=300)
     plt.close()
     print(f"✅ Saved heatmap to: {out_path}")
+
+
+def visualize_samples(model, tokenizer, samples, out_dir, device, selected_pairs, head_tags, prefix=""):
+    os.makedirs(out_dir, exist_ok=True)
+    has_selected = bool(selected_pairs)
+    prefix = (prefix or "").strip()
+    fname_prefix = f"{prefix}_" if prefix else ""
+
+    for sample in tqdm(samples, desc=f"Processing Samples → {Path(out_dir).name}"):
+        sys_msg = sample["system_message"]
+        usr_msg = sample.get("user_message", "") or ""
+        messages = [{"role": "system", "content": sys_msg}]
+        if usr_msg.strip():
+            messages.append({"role": "user", "content": usr_msg})
+
+        with torch.no_grad():
+            chat_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            inputs = tokenizer(chat_input, return_tensors="pt")
+            if device is not None:
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        sys_ids = tokenizer(sys_msg, add_special_tokens=False)["input_ids"]
+        usr_ids = tokenizer(usr_msg, add_special_tokens=False)["input_ids"] if usr_msg.strip() else []
+        full_ids = inputs["input_ids"][0].tolist()
+        sys_range, usr_range = build_token_ranges(tokenizer, full_ids, sys_ids, usr_ids)
+        s0, s1 = sys_range
+
+        with torch.no_grad():
+            outputs = model(**inputs, output_attentions=True)
+
+        mat = average_heads_last_token(outputs.attentions)
+        tokens = [tokenizer.decode([t]) for t in full_ids]
+        wanted_idx = list(range(len(tokens)))
+        sub_mat = mat[:, wanted_idx]
+        sub_tokens = [tokens[i] for i in wanted_idx]
+
+        sample_id = sample.get('id', 'unknown')
+        title = f"Last-Token → System/User Tokens  (sample id: {sample_id})"
+
+        row_labels = head_tags if has_selected else [f"L{l}" for l in range(mat.shape[0])]
+        plot_heatmap(
+            sub_mat,
+            sub_tokens,
+            row_labels,
+            os.path.join(out_dir, f"{fname_prefix}{sample_id}_attn_map.png"),
+            title,
+        )
+
+        if has_selected:
+            mat_all = last_token_selected_heads(outputs.attentions, selected_pairs)
+            sub_mat2 = mat_all[:, wanted_idx]
+            sub_tokens2 = [tokens[i] for i in wanted_idx]
+            plot_heatmap(
+                sub_mat2,
+                sub_tokens2,
+                head_tags,
+                os.path.join(out_dir, f"{fname_prefix}{sample_id}_imp_heads.png"),
+                " ",
+            )
 
 
 def main(args):
@@ -201,75 +281,49 @@ def main(args):
         trust_remote_code=True,
         attn_implementation="eager"
     )
+    model.eval()
 
-    if args.lora_path and args.lora_path.strip() != "":
-        print(f"🟣 Applying LoRA adapter from {args.lora_path}")
+    if args.important_file and os.path.exists(args.important_file):
+        selected_pairs, head_tags = load_important_heads(args.important_file)
+        print("✔ Loaded important heads:", head_tags)
+    else:
+        selected_pairs, head_tags = [], []
+        print("⚠ No important_heads.json found, visualizing average over all heads")
+
+    base_out = args.output_path
+    visualize_samples(
+        model,
+        tokenizer,
+        samples,
+        base_out,
+        device,
+        selected_pairs,
+        head_tags,
+        prefix=args.base_prefix,
+    )
+
+    lora_path = (args.lora_path or "").strip()
+    if lora_path:
+        print(f"🟣 Applying LoRA adapter from {lora_path}")
         model = PeftModel.from_pretrained(
             model,
-            args.lora_path,
+            lora_path,
             device_map="auto" if device is None else {"": device.index}
+        )
+        lora_out = args.lora_output_path or base_out
+        lora_prefix = args.lora_prefix.strip() if args.lora_prefix else Path(lora_path.rstrip("/")).name
+        visualize_samples(
+            model,
+            tokenizer,
+            samples,
+            lora_out,
+            device,
+            selected_pairs,
+            head_tags,
+            prefix=lora_prefix,
         )
     else:
         print("⚪️ No LoRA adapter applied, using base model only.")
-
-    model.eval()
-    out_dir = args.output_path
-    os.makedirs(out_dir, exist_ok=True)
-
-    for sample in tqdm(samples, desc="Processing Samples"):
-        sys_msg = sample["system_message"]
-        usr_msg = sample.get("user_message", "") or ""
-        messages = [{"role": "system", "content": sys_msg}]
-        if usr_msg.strip():
-            messages.append({"role": "user", "content": usr_msg})
-
-        with torch.no_grad():
-            chat_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-            inputs = tokenizer(chat_input, return_tensors="pt")
-            if device is not None:
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        sys_ids = tokenizer(sys_msg, add_special_tokens=False)["input_ids"]
-        usr_ids = tokenizer(usr_msg, add_special_tokens=False)["input_ids"] if usr_msg.strip() else []
-        full_ids = inputs["input_ids"][0].tolist()
-        sys_range, usr_range = build_token_ranges(tokenizer, full_ids, sys_ids, usr_ids)
-        s0, s1 = sys_range
-
-        with torch.no_grad():
-            outputs = model(**inputs, output_attentions=True)
-
-        mat = average_heads_last_token(outputs.attentions)
-        tokens = tokenizer.convert_ids_to_tokens(full_ids)
-        wanted_idx = list(range(s0, s1 + 1))
-        if usr_range:
-            u0, u1 = usr_range
-            wanted_idx += list(range(u0, u1 + 1))
-        sub_mat = mat[:, wanted_idx]
-        sub_tokens = [tokens[i] for i in wanted_idx]
-
-        sample_id = sample.get('id', 'unknown')
-        title = f"Last-Token → System/User Tokens  (sample id: {sample_id})"
-
-        if args.important_file and os.path.exists(args.important_file):
-            selected_pairs, head_tags = load_important_heads(args.important_file)
-            print("✔ Loaded important heads:", head_tags)
-            use_all_heads = False
-        else:
-            selected_pairs, head_tags = [], []
-            print("⚠ No important_heads.json found, visualizing average over all heads")
-            use_all_heads = True
-
-        row_labels = head_tags if not use_all_heads else [f"L{l}" for l in range(mat.shape[0])]
-        plot_heatmap(sub_mat, sub_tokens, row_labels, os.path.join(out_dir, f"{sample_id}_attn_map.png"), title)
-
-        with torch.no_grad():
-            outputs = model(**inputs, output_attentions=True)
-
-        mat_all = last_token_selected_heads(outputs.attentions, selected_pairs)
-        sub_mat2 = mat_all[:, wanted_idx]
-        sub_tokens2 = [tokens[i] for i in wanted_idx]
-        title = " "
-        plot_heatmap(sub_mat2, sub_tokens2, head_tags, os.path.join(out_dir, f"{sample_id}_imp_heads.png"), title)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -279,7 +333,11 @@ if __name__ == "__main__":
                         help="Path to base pretrained model.")
     parser.add_argument("--lora_path", type=str, default="", help="Optional LoRA adapter path.")
     parser.add_argument("--json_file", type=str, default="samples.json", help="Input JSON file.")
-    parser.add_argument("--output_path", type=str, default="./attn_vis", help="Output folder for heatmaps.")
+    parser.add_argument("--output_path", type=str, default="./attn_vis", help="Base output folder for heatmaps.")
+    parser.add_argument("--lora_output_path", type=str, default="",
+                        help="Optional output folder for the LoRA adapter visualizations.")
+    parser.add_argument("--base_prefix", type=str, default="", help="Filename prefix for base outputs.")
+    parser.add_argument("--lora_prefix", type=str, default="", help="Filename prefix for LoRA outputs.")
     parser.add_argument("--cuda", type=int, nargs='+', default=[0],
                         help="CUDA device indices, e.g. 0 or 0 1.")
     args = parser.parse_args()

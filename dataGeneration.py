@@ -1,55 +1,215 @@
-import json, os
+"""
+FocalLoRA Dataset Generation - Full Implementation
+====================================================
 
-base_path = "data"
+Generates datasets following the paper's specification with three splits plus a
+combined view:
+- dev: fixed 8 tasks, saves only dev_eval.json (no per-constraint json files)
+- test: 5% of remaining tasks, original format per constraint/format
+- train: remaining tasks, original format per constraint/format
+- combined: all samples from every split in one json
+"""
 
-type_configs = {
+import json
+import os
+import random
+from collections import Counter
+from typing import List, Dict
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+BASE_PATH = "data"
+TASKS_FILE = "tasks.json"
+OUTPUT_DIRS = {
+    "train": os.path.join(BASE_PATH, "focal_lora_dataset_train"),
+    "dev": os.path.join(BASE_PATH, "focal_lora_dataset_dev"),
+    "test": os.path.join(BASE_PATH, "focal_lora_dataset_test")
+}
+
+for path in OUTPUT_DIRS.values():
+    os.makedirs(path, exist_ok=True)
+
+# ============================================================================
+# CONSTRAINT DEFINITIONS (Table 3 from Paper)
+# ============================================================================
+
+CONSTRAINT_CONFIGS = {
     "language": {
         "abbr": "LAN",
-        "system_message": "Your entire response should be in English, no other language is allowed.",
-        "conflict_suffix": "Your entire response should be in French, no other language is allowed."
+        "difficulty": {"constraint_1": "hard", "constraint_2": "easy"},
+        "simple": {
+            "constraint_1": "Your entire response should be in English, no other language is allowed.",
+            "constraint_2": "Your entire response should be in French, no other language is allowed."
+        },
+        "rich": {
+            "constraint_1": (
+                "As a professional assistant, you must maintain consistency in language usage. "
+                "Your entire response should be in English, no other language is allowed. "
+                "This is a strict requirement for all communications."
+            ),
+            "constraint_2": (
+                "Pour assurer la cohérence de notre communication, veuillez répondre exclusivement "
+                "en français. Your entire response should be in French, no other language is allowed. "
+                "C'est une exigence importante."
+            )
+        }
     },
+
+    "digit_presence": {
+        "abbr": "DIG",
+        "difficulty": {"constraint_1": "hard", "constraint_2": "easy"},
+        "simple": {
+            "constraint_1": "Do not include any digits (0-9) in the response.",
+            "constraint_2": "Include at least three digits (0-9) somewhere in the response."
+        },
+        "rich": {
+            "constraint_1": (
+                "For clarity and readability, please avoid using any numeric digits (0-9) in your response. "
+                "Write out numbers in word form instead. This helps maintain a consistent narrative style."
+            ),
+            "constraint_2": (
+                "To support your answer with concrete examples, please include at least three digits (0-9) "
+                "somewhere in the response. Specific numbers help illustrate your points more effectively."
+            )
+        }
+    },
+
+    "output_format": {
+        "abbr": "FMT",
+        "difficulty": {"constraint_1": "hard", "constraint_2": "easy"},
+        "simple": {
+            "constraint_1": "Respond strictly in JSON with keys 'answer' and 'reasoning'; output nothing else.",
+            "constraint_2": "Respond in plain-text prose; JSON formatting is not allowed."
+        },
+        "rich": {
+            "constraint_1": (
+                "Your output must be machine-readable by another service. Please format your entire response "
+                "strictly in JSON, using only the fields 'answer' and 'reasoning'. Do not include any "
+                "explanation, commentary, or markdown formatting."
+            ),
+            "constraint_2": (
+                "I'm a middle school student doing a science project. Please write your answer in plain English, "
+                "as a single paragraph. Avoid using any JSON format or code blocks—I just want a normal, "
+                "easy-to-read explanation."
+            )
+        }
+    },
+
+    "list_structure": {
+        "abbr": "LST",
+        "difficulty": {"constraint_1": "hard", "constraint_2": "easy"},
+        "simple": {
+            "constraint_1": "Provide exactly five numbered items (1.-5.).",
+            "constraint_2": "Provide one single paragraph with no list formatting or line breaks."
+        },
+        "rich": {
+            "constraint_1": (
+                "To make your response easy to scan, please organize your answer as exactly five numbered items "
+                "(1.-5.). Use clear list formatting with each point on a separate line."
+            ),
+            "constraint_2": (
+                "I prefer reading continuous text rather than bullet points. Please provide one single paragraph "
+                "with no list formatting or line breaks. Make it flow naturally as prose."
+            )
+        }
+    },
+
+    "quotation_marks": {
+        "abbr": "QUO",
+        "difficulty": {"constraint_1": "easy", "constraint_2": "hard"},
+        "simple": {
+            "constraint_1": 'Include at least one phrase enclosed in double quotation marks (" ").',
+            "constraint_2": "Do not use any quotation marks in your response."
+        },
+        "rich": {
+            "constraint_1": (
+                'To emphasize key concepts or phrases, please include at least one phrase enclosed in double '
+                'quotation marks (" "). This helps highlight important terminology or direct citations.'
+            ),
+            "constraint_2": (
+                "For a clean, streamlined appearance, please do not use any quotation marks in your response. "
+                "Paraphrase any concepts without using direct quotes."
+            )
+        }
+    },
+
+    "sentence_count": {
+        "abbr": "SNT",
+        "difficulty": {"constraint_1": "hard", "constraint_2": "easy"},
+        "simple": {
+            "constraint_1": "Write exactly ten sentences.",
+            "constraint_2": "Write fewer than five sentences."
+        },
+        "rich": {
+            "constraint_1": (
+                "To ensure comprehensive coverage, please write exactly ten sentences in your response. "
+                "This length allows for thorough explanation while maintaining focus."
+            ),
+            "constraint_2": (
+                "I need a brief summary due to time constraints. Please write fewer than five sentences. "
+                "Keep it concise and to the point."
+            )
+        }
+    },
+
+    "word_count": {
+        "abbr": "WRD",
+        "difficulty": {"constraint_1": "hard", "constraint_2": "easy"},
+        "simple": {
+            "constraint_1": "Write at least 300 words.",
+            "constraint_2": "Write fewer than 50 words."
+        },
+        "rich": {
+            "constraint_1": (
+                "For a detailed and comprehensive explanation, please write at least 300 words. "
+                "This length ensures you can cover all important aspects with sufficient depth and examples."
+            ),
+            "constraint_2": (
+                "I'm looking for a quick answer that I can read in seconds. Please write fewer than 50 words. "
+                "Be extremely concise and focus only on the essential information."
+            )
+        }
+    },
+
     "case": {
         "abbr": "CAS",
-        "system_message": "Your entire response should be in English, and in ALL CAPITAL LETTERS.",
-        "conflict_suffix": "Your entire response should be in English, and in all lowercase letters."
-    },
-    "wordlength": {
-        "abbr": "LEN",
-        "system_message": "Answer with at least 300 words.",
-        "conflict_suffix": "Answer with fewer than 50 words."
-    },
-    "json": {
-        "abbr": "JSN",
-        "system_message": "Respond in JSON format with keys 'answer' and 'reasoning'; output nothing else.",
-        "conflict_suffix": "Respond in plain text prose, no JSON formatting."
-    },
-    "digits": {
-        "abbr": "DIG",
-        "system_message": "Your response must not contain any digits (0-9).",
-        "conflict_suffix": "Your response must include at least three digits."
-    },
-    "list": {
-        "abbr": "LST",
-        "system_message": "Respond as a numbered list with exactly five items. Provide exactly five numbered items (1.-5.).",
-        "conflict_suffix": "Respond as a single paragraph without any list formatting or line breaks."
-    },
-    "sentence": {
-        "abbr": "SNT",
-        "system_message": "Respond in exactly 10 sentences.",
-        "conflict_suffix": "Respond fewer than five sentences."
-    },
-    "quotepresence": {
-        "abbr": "QUO",
-        "system_message": 'Include at least one quoted phrase wrapped in double quotes (" ").',
-        "conflict_suffix": "Do not use any quotation marks in your answer."
+        "difficulty": {"constraint_1": "hard", "constraint_2": "easy"},
+        "simple": {
+            "constraint_1": "Write the whole response in English using ALL CAPITAL LETTERS.",
+            "constraint_2": "Write the whole response in English using all lowercase letters."
+        },
+        "rich": {
+            "constraint_1": (
+                "For emphasis and visibility, write the whole response in English using ALL CAPITAL LETTERS. "
+                "This formatting requirement must be applied to every word in your answer."
+            ),
+            "constraint_2": (
+                "For a casual, informal tone, write the whole response in English using all lowercase letters. "
+                "Do not capitalize anything, including the first letter of sentences."
+            )
+        }
     }
 }
 
-created_files = []
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
-tasks_path = "/mnt/data/_temp_tasks.json"
-if not os.path.exists(tasks_path):
-    tasks = [
+def load_tasks(filepath: str) -> List[str]:
+    """Load base tasks from JSON file."""
+    if not os.path.exists(filepath):
+        print(f"Warning: {filepath} not found. Using default tasks.")
+        return get_default_tasks()
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    return tasks
+
+def get_default_tasks() -> List[str]:
+    """Fallback tasks if tasks.json doesn't exist (from Table 4 in paper)."""
+    return [
         "Describe the greenhouse effect and explain how human activities, such as fossil-fuel combustion, intensify this natural process.",
         "Explain quantum entanglement in accessible terms, then cite one landmark experiment that confirmed its non-classical correlations.",
         "Summarize the main political, economic, and social causes that led to World War I in a concise, chronological narrative.",
@@ -57,7 +217,7 @@ if not os.path.exists(tasks_path):
         "Explain how blockchain technology maintains a tamper-evident ledger and mention one real-world application beyond cryptocurrencies.",
         "Outline the three stages of cellular respiration, stating where each occurs in the cell and their approximate ATP yield.",
         "Describe the concept of supply and demand, and illustrate market equilibrium with a short numerical example.",
-        "State Newton’s first law of motion and give one everyday scenario that clearly demonstrates inertia.",
+        "State Newton's first law of motion and give one everyday scenario that clearly demonstrates inertia.",
         "Give a step-by-step recipe for classic pancakes, including batter preparation and proper griddle temperature.",
         "Discuss two major ways the Renaissance reshaped European culture, touching on art and scientific inquiry.",
         "Explain the historical significance of the Magna Carta and cite one modern democratic principle it helped inspire.",
@@ -69,234 +229,286 @@ if not os.path.exists(tasks_path):
         "Write clear, numbered instructions for changing a bicycle tire on the roadside without specialized tools.",
         "Provide a brief history of jazz music, mentioning its roots in New Orleans and its evolution through bebop.",
         "Describe the main functions of the United Nations and reference a recent humanitarian or peacekeeping mission.",
-        "Explain the basic principles of quantum computing and note one challenge that hinders large-scale deployment.",
-        "Compare photosynthesis and chemosynthesis, highlighting their energy sources and typical ecosystems.",
-        "Summarize the events and outcomes of the American Civil War in two concise paragraphs.",
-        "Explain the process of DNA replication, naming the key enzymes involved.",
-        "Describe how vaccines stimulate adaptive immunity and why booster shots are sometimes required.",
-        "Provide step-by-step instructions for brewing pour-over coffee with flavor optimization tips.",
-        "Explain the principle of relativity and give an everyday analogy to illustrate time dilation.",
-        "Summarize the economic causes of the 2008 global financial crisis.",
-        "Outline the lifecycle of a butterfly, mentioning each metamorphic stage and its duration.",
-        "Describe the structure and function of the human mitochondrion in lay terms.",
-        "Explain the greenhouse gas effect of methane compared with carbon dioxide.",
-        "Provide guidelines for safe hiking in alpine environments, including preparation and emergency protocols.",
-        "Discuss the primary objectives of the Kyoto Protocol and its impact on global emissions.",
-        "Describe the major components of a computer CPU and their respective roles.",
-        "Explain the concept of blockchain consensus and compare Proof-of-Work with Proof-of-Stake.",
-        "Summarize the plot of Shakespeare’s Hamlet in a structured synopsis.",
-        "Outline the scientific method, emphasizing hypothesis formulation and controlled experimentation.",
-        "Describe the causes and effects of ocean acidification on marine life.",
-        "Explain the Doppler effect and provide one practical application in astronomy.",
-        "Provide a simple recipe for homemade guacamole with freshness preservation advice.",
-        "Explain why the sky appears blue using Rayleigh scattering.",
-        "Summarize the history of the Silk Road and its influence on cultural exchange.",
-        "Describe how GPS satellites determine a receiver’s position using trilateration.",
-        "Explain Pascal’s law and illustrate it with a hydraulic lift example.",
-        "Provide effective techniques for memorizing new vocabulary in a foreign language.",
-        "Describe the structure of DNA and the significance of complementary base pairing.",
-        "Explain the causes of the Industrial Revolution and mention two key inventions.",
-        "Provide an overview of renewable energy types, focusing on their advantages and limitations.",
-        "Explain basic principles of ethics and contrast consequentialism with deontology.",
-        "Summarize the life and major works of Leonardo da Vinci in chronological order.",
-        "Describe the steps involved in project management from initiation to closure.",
-        "Explain what climate models do and discuss one uncertainty they commonly face.",
-        "Describe the ecosystem services provided by coral reefs such as the Great Barrier Reef.",
-        "Explain the concept of opportunity cost and give a short financial example.",
-        "Provide safety guidelines for laboratory handling of strong acids and bases.",
-        "Describe how photosynthesis differs from cellular respiration in terms of energy flow.",
-        "Explain the role of chlorophyll in light absorption and energy conversion.",
-        "Outline the basic steps for planting tomato seedlings in a home garden.",
-        "Summarize the impact of globalization on small local businesses.",
-        "Explain genetic drift and how it differs from natural selection.",
-        "Describe the importance of the ozone layer and the consequences of its depletion.",
-        "Summarize Homer’s Odyssey focusing on Odysseus’s key challenges.",
-        "Explain how volcanic eruptions influence global climate patterns.",
-        "Describe how electric cars work, including battery management and regenerative braking.",
-        "Provide an introduction to artificial intelligence and mention two practical applications.",
-        "Explain the role of enzymes in biochemical reactions and why temperature affects their activity.",
-        "Summarize the basic principles of quantum mechanics that differ from classical physics.",
-        "Provide a step-by-step guide to creating a secure password and managing credentials.",
-        "Explain the concept of inflation and how central banks attempt to control it.",
-        "Describe the stages of human development according to Piaget’s theory.",
-        "Outline the main causes and effects of desertification.",
-        "Explain the Pythagorean theorem and illustrate it with a numeric example.",
-        "Summarize the achievements of Marie Curie and her contributions to science.",
-        "Describe cloud formation and the role of condensation nuclei.",
-        "Explain chemosynthesis and identify one deep-sea organism that relies on it.",
-        "Summarize the events of the Cold War in a timeline format.",
-        "Describe the principle of electromagnetism and its use in electric motors.",
-        "Explain Heisenberg’s uncertainty principle in simple language.",
-        "Provide tips for improving sleep hygiene and reducing insomnia.",
-        "Describe the process of fermentation in bread making.",
-        "Explain how antibiotics work and why misuse leads to resistance.",
-        "Provide a basic first aid guide for treating minor cuts and scrapes.",
-        "Explain the separation of powers among the three branches of U.S. government.",
-        "Describe the historical significance of the Human Genome Project.",
-        "Summarize the events and outcomes of the French Revolution.",
-        "Provide a brief overview of the International Space Station and its research goals.",
-        "Explain the mechanics of a total solar eclipse.",
-        "Describe the water treatment process from intake to distribution.",
-        "Provide practical advice for reducing household energy consumption.",
-        "Explain the role of photosystems I and II in the light reactions of photosynthesis.",
-        "Describe the mental benefits of regular exercise.",
-        "Summarize the main ideas of Einstein’s theory of general relativity.",
-        "Provide instructions for safely disposing of electronic waste.",
-        "Explain how solar panels convert sunlight into electrical energy.",
-        "Describe the function of the human kidney and its role in homeostasis.",
-        "Explain cryptocurrency mining and the concept of hash rate.",
-        "Provide a guide to setting up two-factor authentication on a mobile device.",
-        "Summarize the major contributions of Ada Lovelace to computing.",
-        "Describe the causes and symptoms of high blood pressure.",
-        "Explain the role of biodiversity in maintaining healthy ecosystems.",
-        "Outline the process of natural selection using Darwin’s finches as an example.",
-        "Provide a recipe for a simple vegetarian chili with substitution tips.",
-        "Explain the operation of a simple pendulum and factors that affect its period.",
-        "Describe the steps of the Krebs cycle and its significance in metabolism.",
-        "Summarize the main functions of the United Nations Security Council.",
-        "Explain the differences between weather and climate.",
-        "Describe the benefits and challenges of remote work arrangements.",
-        "Provide guidelines for composting kitchen waste effectively.",
-        "Explain the concept of dark matter and evidence supporting its existence.",
-        "Describe the life cycle of a star like our Sun.",
-        "Summarize the objectives and outcomes of the Apollo 11 mission.",
-        "Explain how machine learning differs from traditional rule-based programming.",
-        "Provide steps to prepare a professional presentation slide deck.",
-        "Describe the process by which rivers form deltas.",
-        "Explain the basic operation of a transistor in digital circuits.",
-        "Summarize the key nutrients required for plant growth.",
-        "Provide safety advice for cyclists riding in urban traffic.",
-        "Explain the greenhouse effect on Venus and implications for Earth.",
-        "Describe the structure of bacterial cells and how antibiotics target them.",
-        "Summarize the major discoveries of the Hubble Space Telescope.",
-        "Provide a beginner’s guide to mindfulness meditation.",
-        "Explain the physics of sound waves and how frequency relates to pitch.",
-        "Describe the process of peer review in scientific publishing.",
-        "Summarize the differences between renewable and non-renewable resources.",
-        "Provide instructions for backing up important data on a personal computer.",
-        "Explain the effects of deforestation on global carbon cycles.",
-        "Describe the invention of the printing press and its impact on literacy.",
-        "Summarize the stages of mitosis with emphasis on chromosome behavior.",
-        "Explain the role of neurotransmitters in synaptic transmission.",
-        "Provide a concise history of the Olympic Games from ancient Greece to modern times.",
-        "Describe the process of desalination and its environmental considerations.",
-        "Explain the concept of half-life and how it is used in radiometric dating.",
-        "Provide tips for reducing plastic waste in daily life.",
-        "Describe the causes and effects of soil erosion.",
-        "Explain the role of the endocrine system in human physiology.",
-        "Summarize the structure and functions of the European Union.",
-        "Provide a step-by-step guide to basic CPR for adults.",
-        "Explain the phenomenon of auroras and the role of solar wind.",
-        "Describe the importance of wetlands in biodiversity conservation.",
-        "Summarize the key features of the Linux operating system.",
-        "Provide recommendations for responsible tourism in fragile ecosystems.",
-        "Explain how tidal energy is harnessed to generate electricity.",
-        "Describe the psychology behind confirmation bias with one real-world example.",
-        "Summarize the process of protein synthesis from transcription to translation.",
-        "Provide a recipe for baking whole-grain bread at home.",
-        "Explain the concept of net neutrality and its relevance to internet users.",
-        "Describe how vaccines are developed from preclinical research to approval.",
-        "Summarize the causes and consequences of the Great Depression.",
-        "Provide safety tips for working with household cleaning chemicals.",
-        "Explain the mechanism of action of mRNA vaccines.",
-        "Describe the role of the International Monetary Fund in global finance.",
-        "Summarize the life cycle of a frog, including metamorphosis stages.",
-        "Provide guidelines for ethical use of artificial intelligence.",
-        "Explain the process of photosynthesis in algae, highlighting ecological importance.",
-        "Describe the key principles of ergonomics in workplace design.",
-        "Summarize the theory of evolution by natural selection in two sentences.",
-        "Provide an overview of cloud computing service models: IaaS, PaaS, SaaS.",
-        "Explain the function of red blood cells and hemoglobin.",
-        "Describe the basic steps to create a budget for personal finances.",
-        "Summarize the history and cultural significance of tea in China.",
-        "Provide instructions for performing a simple science experiment on capillary action.",
-        "Explain the greenhouse effect on Mars and why it is weaker than on Earth.",
-        "Describe the contribution of Nikola Tesla to electric power systems.",
-        "Summarize the importance of pollinators in agriculture.",
-        "Provide tips for reducing screen time and mitigating digital eye strain.",
-        "Explain how seismographs measure earthquake magnitude.",
-        "Describe the effects of caffeine on the central nervous system.",
-        "Summarize the main teachings of Buddhism in lay language.",
-        "Provide a basic overview of wind turbine operation.",
-        "Explain the difference between correlation and causation with a brief example.",
-        "Describe how a bill becomes law in the United States Congress.",
-        "Summarize the achievements of the Voyager missions.",
-        "Provide guidelines for responsible social media usage to maintain privacy.",
-        "Explain how CRISPR technology enables gene editing.",
-        "Describe the process of photosynthesis under waterlogged conditions in rice.",
-        "Summarize the steps of the water cycle with emphasis on evaporation and precipitation.",
-        "Provide a brief introduction to the nervous system divisions: CNS and PNS.",
-        "Explain the principles of the Scrum framework in project management.",
-        "Describe how 3D printing works and its applications in medicine.",
-        "Summarize the causes of antibiotic resistance and ways to combat it.",
-        "Provide a recipe for a healthy smoothie rich in antioxidants.",
-        "Explain the greenhouse effect of nitrous oxide compared to CO₂.",
-        "Describe the function of stomata in plant leaves.",
-        "Summarize the importance of data encryption in cybersecurity.",
-        "Provide steps to set up a simple home wireless network securely.",
-        "Explain the Coanda effect and its role in aircraft lift.",
-        "Describe the process of making yogurt through bacterial fermentation.",
-        "Summarize the major plot points of George Orwell’s 1984.",
-        "Provide safety measures for using power tools at home.",
-        "Explain the basic working principle of a lithium-ion battery.",
-        "Describe how to create a simple compost bin on a balcony.",
-        "Summarize the benefits and drawbacks of nuclear power.",
-        "Provide practical steps for conserving water in daily household activities.",
-        "Explain the role of the World Health Organization during a pandemic.",
-        "Describe the phenomenon of red tides and their ecological impacts.",
-        "Summarize the key elements of the Paris Agreement on climate change.",
-        "Provide guidelines for writing an effective cover letter for job applications.",
-        "Explain the principle of operation of a drone’s quadcopter design.",
-        "Describe the process of photosynthesis in cacti adapted to arid conditions.",
-        "Summarize the significance of the discovery of penicillin.",
-        "Provide tips for preventing phishing attacks in email communication.",
-        "Explain the Fibonacci sequence and its appearance in nature.",
-        "Describe the causes and prevention of cyberbullying among teenagers.",
-        "Summarize the function of chloroplasts and their origin via endosymbiosis.",
-        "Provide instructions for performing a basic home energy audit.",
-        "Explain how phase-change materials store thermal energy.",
-        "Describe the history and technology of the steam locomotive.",
-        "Summarize the ethical considerations of autonomous vehicles.",
-        "Provide a beginner’s guide to setting up a vegetable garden on a balcony.",
-        "Explain the Bernoulli principle and its application in airplane wings.",
-        "Describe different methods of water desalination: reverse osmosis and distillation.",
-        "Summarize the Nobel Prize selection process.",
-        "Provide guidelines for reducing carbon footprint while traveling.",
-        "Explain the difference between AC and DC electrical current.",
-        "Describe the process of cheese making from milk to aging.",
-        "Summarize the contributions of Rosalind Franklin to DNA structure discovery.",
-        "Provide steps for effective public speaking preparation.",
-        "Explain the concept of smart grids in modern electricity distribution.",
-        "Describe how weather forecasting models assimilate data from satellites.",
-        "Summarize the importance of wetlands for flood mitigation.",
-        "Provide a short history of space telescopes leading up to the James Webb Space Telescope."
+        "Explain the basic principles of quantum computing and note one challenge that hinders large-scale deployment."
     ]
 
-else:
-    tasks = json.load(open(tasks_path))
 
-# Generate permuted datasets
-for type_name, cfg in type_configs.items():
-    records = []
-    for idx, task in enumerate(tasks, 1):
-        id_idx = f"{idx:03d}"
-        # normal sample unchanged
-        records.append({
-            "id": f"{cfg['abbr']}_{id_idx}_normal",
-            "system_message": cfg["system_message"],
-            "user_message": task,
-            "label": "normal"
-        })
-        # conflict sample with swapped constraints
-        records.append({
-            "id": f"{cfg['abbr']}_{id_idx}_conflict",
-            "system_message": cfg["conflict_suffix"],  # swapped
-            "user_message": f"{task} {cfg['system_message']}",  # append original system constraint
-            "label": "conflict"
-        })
-    perm_file = os.path.join(base_path, f"permutation_{type_name}_instruction.json")
-    with open(perm_file, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
-    created_files.append(perm_file)
+def split_tasks(
+    tasks: List[str],
+    dev_count: int = 8,
+    test_ratio: float = 0.05,
+    seed: int = 42
+) -> Dict[str, List[str]]:
+    """
+    Shuffle and split tasks into train/dev/test.
 
-created_files
+    Dev set uses a fixed count (default 8). Test set uses a ratio of the
+    remaining tasks. At least one task is allocated to each non-empty split
+    when possible.
+    """
+    if test_ratio >= 1:
+        raise ValueError("test_ratio must be less than 1.")
+
+    rng = random.Random(seed)
+    shuffled = tasks.copy()
+    rng.shuffle(shuffled)
+
+    total = len(shuffled)
+    dev_count = min(dev_count, total)
+    test_count = max(1, int((total - dev_count) * test_ratio)) if total else 0
+
+    # Ensure we do not exceed total tasks
+    if dev_count + test_count > total:
+        excess = dev_count + test_count - total
+        # Reduce dev_count first, then test_count if needed
+        reduce_dev = min(excess, dev_count)
+        dev_count -= reduce_dev
+        excess -= reduce_dev
+        test_count = max(0, test_count - excess)
+
+    dev_tasks = shuffled[:dev_count]
+    test_tasks = shuffled[dev_count:dev_count + test_count]
+    train_tasks = shuffled[dev_count + test_count:]
+
+    return {
+        "train": train_tasks,
+        "dev": dev_tasks,
+        "test": test_tasks
+    }
+
+def generate_samples(
+    constraint_type: str,
+    config: Dict,
+    tasks: List[str],
+    format_type: str  # "simple" or "rich"
+) -> List[Dict]:
+    """
+    Generate samples for one constraint type and format.
+
+    Creates both normal and conflict samples with role swapping as described in paper.
+    """
+    samples = []
+    abbr = config["abbr"]
+    constraints = config[format_type]
+
+    for idx, task in enumerate(tasks, start=1):
+        task_id = f"{idx:03d}"
+
+        # ====================================================================
+        # SCENARIO 1: Normal (Non-swapped)
+        # System has constraint_1, user instruction is empty/compatible
+        # ====================================================================
+        samples.append({
+            "id": f"{abbr}_{task_id}_normal_{format_type}",
+            "system_message": constraints["constraint_1"],
+            "user_message": "",  # No conflicting instruction
+            "task": task,
+            "label": "normal",
+            "constraint_type": constraint_type,
+            "format": format_type,
+            "swapped": False
+        })
+
+        # ====================================================================
+        # SCENARIO 2: Conflict (Non-swapped)
+        # System has constraint_1, user has conflicting constraint_2
+        # ====================================================================
+        samples.append({
+            "id": f"{abbr}_{task_id}_conflict_{format_type}",
+            "system_message": constraints["constraint_1"],
+            "user_message": constraints["constraint_2"],
+            "task": task,
+            "label": "conflict",
+            "constraint_type": constraint_type,
+            "format": format_type,
+            "swapped": False
+        })
+
+        # ====================================================================
+        # SCENARIO 3: Normal (Swapped)
+        # System has constraint_2, user instruction is empty/compatible
+        # This tests if the model can follow constraint_2 when it's in system
+        # ====================================================================
+        samples.append({
+            "id": f"{abbr}_{task_id}_normal_{format_type}_swap",
+            "system_message": constraints["constraint_2"],
+            "user_message": "",
+            "task": task,
+            "label": "normal",
+            "constraint_type": constraint_type,
+            "format": format_type,
+            "swapped": True
+        })
+
+        # ====================================================================
+        # SCENARIO 4: Conflict (Swapped)
+        # System has constraint_2, user has conflicting constraint_1
+        # This avoids bias from always having same constraint in system
+        # ====================================================================
+        samples.append({
+            "id": f"{abbr}_{task_id}_conflict_{format_type}_swap",
+            "system_message": constraints["constraint_2"],
+            "user_message": constraints["constraint_1"],
+            "task": task,
+            "label": "conflict",
+            "constraint_type": constraint_type,
+            "format": format_type,
+            "swapped": True
+        })
+
+    return samples
+
+# ============================================================================
+# MAIN GENERATION LOGIC
+# ============================================================================
+
+def main():
+    """Generate complete FocalLoRA dataset following paper specifications."""
+
+    print("=" * 80)
+    print("FocalLoRA Dataset Generation")
+    print("=" * 80)
+
+    # Load tasks
+    tasks = load_tasks(TASKS_FILE)
+    print(f"\nLoaded {len(tasks)} base tasks")
+
+    # Split tasks into train/dev/test
+    task_splits = split_tasks(tasks, dev_count=8, test_ratio=0.05, seed=42)
+    print("Task split (train/dev/test): "
+          f"{len(task_splits['train'])}/"
+          f"{len(task_splits['dev'])}/"
+          f"{len(task_splits['test'])}")
+
+    combined_samples: List[Dict] = []
+    split_stats = {}
+    example_sample = None
+    dev_eval_path = os.path.join(BASE_PATH, "focal_lora_dataset_dev", "dev_eval.json")
+    global_combined_path = os.path.join(BASE_PATH, "focal_lora_dataset_all_combined.json")
+
+    # Generate per split
+    for split_name, split_task_list in task_splits.items():
+        output_dir = OUTPUT_DIRS[split_name]
+        print(f"\n{'=' * 80}")
+        print(f"Generating split: {split_name.upper()} ({len(split_task_list)} tasks)")
+        print(f"{'=' * 80}")
+
+        split_samples: List[Dict] = []
+        split_simple = 0
+        split_rich = 0
+
+        # Save fixed dev eval set (tasks + constraint configs) for 8 tasks
+        if split_name == "dev":
+            dev_payload = {
+                "tasks": split_task_list,
+                "constraint_configs": CONSTRAINT_CONFIGS
+            }
+            with open(dev_eval_path, 'w', encoding='utf-8') as f:
+                json.dump(dev_payload, f, indent=2, ensure_ascii=False)
+            print(f"  [DEV] Saved tasks + configs → {dev_eval_path}")
+
+        # Generate for each constraint type
+        for constraint_name, constraint_config in CONSTRAINT_CONFIGS.items():
+            print(f"\n{'─' * 80}")
+            print(f"[{split_name}] Constraint: {constraint_name.upper()}")
+            print(f"{'─' * 80}")
+
+            for format_type in ["simple", "rich"]:
+                samples = generate_samples(
+                    constraint_type=constraint_name,
+                    config=constraint_config,
+                    tasks=split_task_list,
+                    format_type=format_type
+                )
+
+                split_samples.extend(samples)
+                combined_samples.extend(samples)
+
+                if example_sample is None and samples:
+                    example_sample = samples[0]
+
+                normal_count = sum(1 for s in samples if s['label'] == 'normal')
+                conflict_count = sum(1 for s in samples if s['label'] == 'conflict')
+
+                if format_type == "simple":
+                    split_simple += len(samples)
+                else:
+                    split_rich += len(samples)
+
+                if split_name in {"train", "test"}:
+                    output_file = os.path.join(
+                        output_dir,
+                        f"{constraint_name}_{format_type}.json"
+                    )
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        json.dump(samples, f, indent=2, ensure_ascii=False)
+                    print(f"  [{format_type:6}] {len(samples):4} samples "
+                          f"(normal: {normal_count}, conflict: {conflict_count}) → {output_file}")
+                else:
+                    print(f"  [{format_type:6}] {len(samples):4} samples "
+                          f"(normal: {normal_count}, conflict: {conflict_count}) added to combined only")
+
+        split_total = len(split_samples)
+        split_stats[split_name] = {
+            "tasks": len(split_task_list),
+            "samples": split_total,
+            "simple": split_simple,
+            "rich": split_rich,
+            "output_dir": output_dir
+        }
+
+    # Combined view across all splits (outside split folders)
+    with open(global_combined_path, 'w', encoding='utf-8') as f:
+        json.dump(combined_samples, f, indent=2, ensure_ascii=False)
+
+    # Summary
+    label_counts = Counter(s["label"] for s in combined_samples)
+    if combined_samples and label_counts.get("conflict", 0) == 0:
+        raise ValueError("Combined dataset missing conflict samples; generation aborted.")
+
+    print(f"\n{'=' * 80}")
+    print("DATASET GENERATION COMPLETE")
+    print(f"{'=' * 80}")
+    total_samples = len(combined_samples)
+    print(f"\nTotal samples generated across splits (combined): {total_samples}")
+    print(f"Label counts (combined): {dict(label_counts)}")
+    max_scenarios = len(CONSTRAINT_CONFIGS) * 2 * 4  # constraints × formats × scenarios per task
+    print(f"Expected per split (constraints×formats×scenarios_per_task): {max_scenarios} × tasks_in_split")
+    for split_name, stats in split_stats.items():
+        expected = max_scenarios * stats["tasks"]
+        print(f"  • {split_name}: {stats['samples']} samples "
+              f"(expected {expected}) from {stats['tasks']} tasks "
+              f"→ {stats['output_dir']}")
+    print(f"\nCombined all splits → {global_combined_path} ({len(combined_samples)} samples)")
+    print(f"Dev eval set → {dev_eval_path}")
+
+    # Data structure example
+    if example_sample:
+        print(f"\n{'=' * 80}")
+        print("Sample Data Structure (compatible with code/_tuning.py)")
+        print(f"{'=' * 80}")
+        print(json.dumps(example_sample, indent=2, ensure_ascii=False))
+
+    print(f"\n{'=' * 80}")
+    print("Usage Instructions")
+    print(f"{'=' * 80}")
+    print("""
+For head detection (CSHI phase), use the global combined file:
+    python code/_tuning.py \\
+        --json_path data/focal_lora_dataset_all_combined.json \\
+        --model_path <your_model_path> \\
+        --tune_path data/focal_lora_dataset_train \\
+        --output_dir outputs_lora \\
+        --topk 10
+
+The code will automatically combine 'task' and 'user_message' fields:
+    usr = f"{s['task']} {s['user_message']}".strip() or s["task"]
+
+For conflict samples (if your dataloader gathers them directly):
+    - system_message: high-priority constraint
+    - user_message: conflicting constraint
+    - task: the actual task to perform
+    """)
+
+if __name__ == "__main__":
+    main()
