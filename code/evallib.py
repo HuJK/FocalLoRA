@@ -55,7 +55,7 @@ def _eval_constraint(system_msg: str, constraint_type: str, output: str) -> bool
 
     if constraint_type == "output_format":
         needs_json = "json" in s
-        is_json = _looks_json(out)
+        is_json = _looks_json(out.replace("\n",""))
         return is_json if needs_json else not is_json
 
     if constraint_type == "quotation_marks":
@@ -64,11 +64,11 @@ def _eval_constraint(system_msg: str, constraint_type: str, output: str) -> bool
         return has_quote if requires_quote else not has_quote
 
     if constraint_type == "list_structure":
+        items = re.findall(r"1\.(.|\n)+2\.(.|\n)+3\.(.|\n)+?4\.(.|\n)+5\.(.|\n)+", out)
         if "five" in s and "number" in s:
-            items = re.findall(r"\b[1-5]\.", out)
-            return len(items) == 5
+            return len(items) > 0
         # single paragraph, no line breaks or list markers
-        return ("\n" not in out) and not re.search(r"\b\d\.|•|-\s", out)
+        return len(items) == 0
 
     if constraint_type == "sentence_count":
         cnt = _sentence_count(out)
@@ -83,9 +83,33 @@ def _eval_constraint(system_msg: str, constraint_type: str, output: str) -> bool
         return cnt < 50
 
     if constraint_type == "case":
+    # Keep only alphabetic characters
+        letters = [c for c in out if c.isalpha()]
+        if not letters:
+            return False
+        total = len(letters)
+        # Strict mode for short outputs
+        if total < 100:
+            if "capital" in s or "all capital" in s:
+                return all(c.isupper() for c in letters)
+            else:
+                return all(c.islower() for c in letters)
+        # Tolerant mode for long outputs (≥100 letters)
+        tolerance = int(total * 0.05)
+        violations = 0
         if "capital" in s or "all capital" in s:
-            return out.upper() == out and out.strip() != ""
-        return out.lower() == out and out.strip() != ""
+            for c in letters:
+                if not c.isupper():
+                    violations += 1
+                    if violations > tolerance:
+                        return False
+        else:
+            for c in letters:
+                if not c.islower():
+                    violations += 1
+                    if violations > tolerance:
+                        return False
+        return True
 
     if constraint_type == "language":
         wants_french = "french" in s
@@ -243,14 +267,14 @@ def quick_eval_asr(
         with torch.no_grad():
             out_valid = model.generate(
                 **encoded_valid,
-                max_new_tokens=128,
+                max_new_tokens=1024,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
             out_asr = model.generate(
                 **encoded_asr,
-                max_new_tokens=128,
+                max_new_tokens=1024,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,

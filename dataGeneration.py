@@ -118,7 +118,7 @@ CONSTRAINT_CONFIGS = {
 
     "quotation_marks": {
         "abbr": "QUO",
-        "difficulty": {"constraint_1": "easy", "constraint_2": "hard"},
+        "difficulty": {"constraint_1": "hard", "constraint_2": "easy"},
         "simple": {
             "constraint_1": 'Include at least one phrase enclosed in double quotation marks (" ").',
             "constraint_2": "Do not use any quotation marks in your response."

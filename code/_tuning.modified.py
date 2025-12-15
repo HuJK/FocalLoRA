@@ -144,8 +144,91 @@ def make_sys_mask(input_ids: torch.Tensor, sub_ids: torch.Tensor, tokenizer) -> 
             print("input_ids:", tokenizer.decode(input_ids[b], skip_special_tokens=False))
             print("sub_ids:  ", tokenizer.decode(sub_ids[b, :L], skip_special_tokens=False))
 
+    # Attention Sink
+    B, L = input_ids.shape
+    non_pad = (input_ids != pad_id)   # [B, L], bool
+    first_nonpad = non_pad.int().argmax(dim=1)   # [B]
+    positions = torch.arange(L, device=input_ids.device).unsqueeze(0)  # [1, L]
+    window_mask = (positions >= first_nonpad.unsqueeze(1)) & \
+                  (positions <  (first_nonpad + 4).unsqueeze(1)) & \
+                  non_pad
+    mask |= window_mask        # or: mask = window_mask.clone() if you want only this
     return mask
 
+
+def make_orig_sys_mask(input_ids: torch.Tensor, tok) -> torch.Tensor:
+    pad_id = tok.pad_token_id
+    B, L = input_ids.shape
+    mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    tid = tok.convert_tokens_to_ids
+    start_header = tid("<|start_header_id|>")
+    end_header = tid("<|end_header_id|>")
+    eot = tok.eos_token_id
+    sys_tok = tid("<|system|>")
+    end_tok = tid("<|end|>")
+    im_start = tid("<|im_start|>")
+    im_end = tid("<|im_end|>")
+    inst_start = tid("[INST]")
+    inst_end = tid("[/INST]")
+
+    for b in range(B):
+        row = input_ids[b].tolist()
+        # Format a: header template
+        if start_header in row:
+            try:
+                s = row.index(end_header) + 1
+                e = row.index(eot)
+                mask[b, s:e] = True
+                continue
+            except ValueError:
+                pass
+        # Format b: ChatML <|system|>
+        if sys_tok in row:
+            try:
+                s = row.index(sys_tok) + 1
+                e = row.index(end_tok, s)
+                mask[b, s:e] = True
+                continue
+            except ValueError:
+                pass
+        # Format c: OpenChat <|im_start|> system <|im_end|>
+        if im_start in row and im_end in row:
+            for pos in [i for i, t in enumerate(row) if t == im_start]:
+                if pos + 1 < L and tok.decode([row[pos + 1]]).strip() == "system":
+                    s = pos + 2
+                    e = row.index(im_end, s)
+                    mask[b, s:e] = True
+                    break
+            if mask[b].any():
+                continue
+        # Format d: [INST]...[/INST]
+        if inst_start in row and inst_end in row:
+            ist = row.index(inst_start) + 1
+            iend = row.index(inst_end)
+            split = None
+            for i in range(ist, iend - 1):
+                if input_ids[b, i].item() == eot and input_ids[b, i + 1].item() == eot:
+                    split = i
+                    break
+            if split is None:
+                for i in range(ist, iend):
+                    if tok.decode([row[i]]).isspace():
+                        split = i
+                        break
+            if split and ist < split:
+                mask[b, ist:split] = True
+            else:
+                mask[b, ist:iend] = True
+    # Attention Sink
+    B, L = input_ids.shape
+    non_pad = (input_ids != pad_id)   # [B, L], bool
+    first_nonpad = non_pad.int().argmax(dim=1)   # [B]
+    positions = torch.arange(L, device=input_ids.device).unsqueeze(0)  # [1, L]
+    window_mask = (positions >= first_nonpad.unsqueeze(1)) & \
+                  (positions <  (first_nonpad + 4).unsqueeze(1)) & \
+                  non_pad
+    mask |= window_mask        # or: mask = window_mask.clone() if you want only this
+    return mask
 # ======================================================
 # 4️⃣  Identify important attention heads
 # ======================================================
@@ -517,7 +600,8 @@ def tune(model, tok,tok_inf, heads, data_dir, out_dir, epochs, bs, lr, lam_foc,
             batch = {k: v.to(model.device) for k, v in batch.items()}
             #breakpoint()
             out = model(**batch, output_attentions=True)
-            sys_mask = make_sys_mask(batch["input_ids"], batch["system_ids"],tok)
+            # sys_mask = make_sys_mask(batch["input_ids"], batch["system_ids"],tok)
+            sys_mask = make_orig_sys_mask(batch["input_ids"], tok)
             loss = lam_foc * focus_loss(out.attentions, sys_mask, heads)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -528,9 +612,7 @@ def tune(model, tok,tok_inf, heads, data_dir, out_dir, epochs, bs, lr, lam_foc,
             current_ratio = float(loss.detach().cpu().item()) / lam_foc
             current_ratio = 1 - current_ratio
             if  idx % 100 == 0:
-                save_path, eval_summary = save_model(
-                    model, tok_inf, out_dir, current_idx, idx, current_ratio, heads=heads
-                )
+                save_path, eval_summary = save_model( model, tok_inf, out_dir, current_idx, idx, current_ratio, heads=heads )
                 eval_metrics = eval_summary.get("asr", {}) if isinstance(eval_summary, dict) else {}
                 conflict_success = eval_metrics.get("conflict_success")
                 print(f"✅ LoRA adapter checkpoint saved → {save_path} (conflict_success={conflict_success if conflict_success is not None else 'n/a'})")
